@@ -1,0 +1,11 @@
+# Only backend/ and frontend/ go into the image; keep secrets and local tooling out of the build context.
+.env
+Credentials/
+venv/
+.venv/
+**/__pycache__/
+*.twb
+*.twbx
+tableau_build/
+tableau_extension/
+snowflake_native_app/

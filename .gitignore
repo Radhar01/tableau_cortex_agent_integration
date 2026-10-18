@@ -1,0 +1,41 @@
+# Environment variables and secrets
+.env
+Credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Tableau workbooks (contain Snowflake account hostnames/usernames) and backups
+*.twb
+*.twbx
+*.twbr
+
+# Tableau extension manifests (generate locally with tableau_extension/build_trex.py)
+*.trex
+
+# Docker
+*.tar
+
+# Claude Code personal settings
+.claude/settings.local.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

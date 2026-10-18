@@ -1,0 +1,7 @@
+name: cortex_chat
+channels:
+  - snowflake
+dependencies:
+  - streamlit=1.52.2
+  - snowflake-snowpark-python
+  - pandas

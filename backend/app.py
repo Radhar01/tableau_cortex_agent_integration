@@ -1,0 +1,353 @@
+import os
+import json
+import logging
+import datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Optional
+
+import requests
+import snowflake.connector
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# .env stays at the project root, shared with tableau_extension/ and snowflake_native_app/.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", PROJECT_ROOT / "frontend"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Cortex Agent Tableau Middleware")
+
+cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_HOST = os.getenv("SNOWFLAKE_HOST")
+SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE", "SYSADMIN")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+# Trial accounts cannot call Cortex Agents; this mode calls Cortex Analyst
+# with the semantic view directly and runs the generated SQL instead.
+USE_CORTEX_ANALYST = os.getenv("USE_CORTEX_ANALYST", "false").lower() == "true"
+
+
+def _load_agent_profiles() -> dict:
+    """Read agent profiles from AGENTS=ID1,ID2 and <ID>_DATABASE, <ID>_SCHEMA, ... variables.
+
+    Without AGENTS, a single DEFAULT profile is built from the original
+    SNOWFLAKE_DATABASE / SNOWFLAKE_SCHEMA / AGENT_NAME / SEMANTIC_VIEW variables.
+    """
+    ids = [i.strip().upper() for i in os.getenv("AGENTS", "").split(",") if i.strip()]
+    if not ids:
+        database = os.getenv("SNOWFLAKE_DATABASE", "TABLEAU_DEMO")
+        schema = os.getenv("SNOWFLAKE_SCHEMA", "TABLEAU_AGENT_DEMO")
+        return {"DEFAULT": {
+            "id": "DEFAULT",
+            "label": os.getenv("AGENT_LABEL", "Sales Analytics"),
+            "database": database,
+            "schema": schema,
+            "agent_name": os.getenv("AGENT_NAME", "SALES_AGENT"),
+            "semantic_view": os.getenv("SEMANTIC_VIEW", f"{database}.{schema}.SALES_SEMANTIC_VIEW"),
+            "warehouse": SNOWFLAKE_WAREHOUSE,
+            "suggestions": [],
+        }}
+    profiles = {}
+    for pid in ids:
+        def var(name, default=None):
+            value = os.getenv(f"{pid}_{name}", default)
+            if value is None:
+                raise RuntimeError(f"Missing {pid}_{name} in .env (listed in AGENTS)")
+            return value
+        database, schema = var("DATABASE"), var("SCHEMA")
+        profiles[pid] = {
+            "id": pid,
+            "label": var("LABEL", pid.title()),
+            "database": database,
+            "schema": schema,
+            "agent_name": var("AGENT_NAME"),
+            "semantic_view": var("SEMANTIC_VIEW", ""),
+            "warehouse": var("WAREHOUSE", SNOWFLAKE_WAREHOUSE),
+            "suggestions": [s.strip() for s in var("SUGGESTIONS", "").split("|") if s.strip()],
+        }
+    return profiles
+
+
+AGENT_PROFILES = _load_agent_profiles()
+DEFAULT_AGENT = next(iter(AGENT_PROFILES))
+
+
+def _profile(agent_id: Optional[str]) -> dict:
+    key = (agent_id or DEFAULT_AGENT).upper()
+    if key not in AGENT_PROFILES:
+        raise HTTPException(status_code=400, detail=f"Unknown agent '{agent_id}'. Configured: {', '.join(AGENT_PROFILES)}")
+    return AGENT_PROFILES[key]
+
+
+SPCS_TOKEN_PATH = "/snowflake/session/token"
+
+
+def _is_running_in_spcs() -> bool:
+    return os.path.exists(SPCS_TOKEN_PATH)
+
+
+def _get_spcs_login_token() -> str:
+    with open(SPCS_TOKEN_PATH, "r") as f:
+        return f.read()
+
+
+def _open_session(profile: dict):
+    """Return (connection, REST host, log tag) for SPCS or local mode."""
+    if _is_running_in_spcs():
+        conn = snowflake.connector.connect(
+            host=SNOWFLAKE_HOST,
+            account=SNOWFLAKE_ACCOUNT,
+            token=_get_spcs_login_token(),
+            authenticator="oauth",
+            warehouse=profile["warehouse"],
+            database=profile["database"],
+            schema=profile["schema"],
+        )
+        return conn, SNOWFLAKE_HOST, "SPCS"
+    conn = snowflake.connector.connect(
+        account=SNOWFLAKE_ACCOUNT,
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        role=SNOWFLAKE_ROLE,
+        warehouse=profile["warehouse"],
+        database=profile["database"],
+        schema=profile["schema"],
+        session_parameters={"PYTHON_CONNECTOR_QUERY_RESULT_FORMAT": "json"},
+    )
+    account_parts = SNOWFLAKE_ACCOUNT.replace("_", "-").split(".")
+    return conn, f"{account_parts[0]}.snowflakecomputing.com", "Local"
+
+
+def _post(conn, url: str, payload: dict, tag: str) -> dict:
+    headers = {
+        "Authorization": f'Snowflake Token="{conn.rest.token}"',
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    logger.info(f"[{tag}] Calling {url}")
+    resp = requests.post(url, json=payload, headers=headers, timeout=120)
+    logger.info(f"[{tag}] Response status: {resp.status_code}")
+    if resp.status_code != 200:
+        logger.error(f"[{tag}] Error: {resp.text[:1000]}")
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+def _call_agent(messages: list, profile: dict) -> dict:
+    conn, host, tag = _open_session(profile)
+    url = (
+        f"https://{host}/api/v2/databases/{profile['database']}"
+        f"/schemas/{profile['schema']}/agents/{profile['agent_name']}:run"
+    )
+    try:
+        return _post(conn, url, {"messages": messages, "stream": False}, tag)
+    finally:
+        conn.close()
+
+
+def _json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    return value
+
+
+def _chat_via_analyst(messages: list, profile: dict) -> "ChatResponse":
+    if not profile["semantic_view"]:
+        raise HTTPException(status_code=400, detail=f"{profile['id']}_SEMANTIC_VIEW is required for Cortex Analyst mode")
+    # Cortex Analyst expects the assistant role to be named "analyst".
+    analyst_messages = [
+        {**m, "role": "analyst" if m.get("role") == "assistant" else m.get("role")}
+        for m in messages
+    ]
+    conn, host, tag = _open_session(profile)
+    try:
+        body = _post(
+            conn,
+            f"https://{host}/api/v2/cortex/analyst/message",
+            {"messages": analyst_messages, "semantic_view": profile["semantic_view"]},
+            tag,
+        )
+        answer_parts = []
+        sql_text = None
+        data_rows = None
+        suggestions = []
+        for item in body.get("message", {}).get("content", []):
+            item_type = item.get("type")
+            if item_type == "text":
+                answer_parts.append(item.get("text", ""))
+            elif item_type == "sql":
+                sql_text = item.get("statement")
+            elif item_type == "suggestions":
+                suggestions.extend(item.get("suggestions", []))
+        if sql_text:
+            cur = conn.cursor(snowflake.connector.DictCursor)
+            rows = cur.execute(sql_text).fetchall()
+            data_rows = [{k: _json_safe(v) for k, v in row.items()} for row in rows]
+            answer_parts.append(f"Returned {len(data_rows)} row(s).")
+    finally:
+        conn.close()
+
+    return ChatResponse(
+        answer="\n\n".join(answer_parts) or "Cortex Analyst returned no answer.",
+        sql=sql_text,
+        data=data_rows,
+        suggestions=suggestions or None,
+    )
+
+
+class ChatRequest(BaseModel):
+    question: str
+    conversation_history: Optional[list] = None
+    agent: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sql: Optional[str] = None
+    data: Optional[list] = None
+    chart_spec: Optional[str] = None
+    suggestions: Optional[list] = None
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    messages = []
+    if req.conversation_history:
+        messages.extend(req.conversation_history)
+    messages.append({
+        "role": "user",
+        "content": [{"type": "text", "text": req.question}],
+    })
+    profile = _profile(req.agent)
+
+    if USE_CORTEX_ANALYST:
+        try:
+            return _chat_via_analyst(messages, profile)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Analyst call failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        body = _call_agent(messages, profile)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent call failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info(f"Agent response keys: {list(body.keys())}")
+    logger.info(f"Agent response: {json.dumps(body, default=str)[:3000]}")
+
+    answer_text = ""
+    sql_text = None
+    data_rows = None
+    chart_spec = None
+    suggestions = []
+
+    for item in body.get("content", []):
+        item_type = item.get("type", "")
+
+        if item_type == "text":
+            answer_text += item.get("text", "")
+
+        elif item_type == "suggested_queries":
+            suggestions.extend(q["query"] for q in item.get("suggested_queries", []) if q.get("query"))
+
+        elif item_type == "tool_result":
+            tr = item.get("tool_result", {})
+            for c in tr.get("content", []):
+                if c.get("type") == "json":
+                    j = c.get("json", {})
+                    if "sql" in j:
+                        sql_text = j["sql"]
+                    if "text" in j and not answer_text:
+                        answer_text = j["text"]
+                    rs = j.get("result_set", {})
+                    if rs.get("data"):
+                        cols = [
+                            col["name"]
+                            for col in rs.get("resultSetMetaData", {}).get("rowType", [])
+                        ]
+                        data_rows = [dict(zip(cols, row)) for row in rs["data"]]
+
+        elif item_type == "chart":
+            chart_info = item.get("chart", {})
+            raw_spec = chart_info.get("chart_spec")
+            if raw_spec:
+                chart_spec = raw_spec if isinstance(raw_spec, str) else json.dumps(raw_spec)
+                logger.info(f"Chart spec (first 500): {chart_spec[:500]}")
+
+        elif item_type == "table":
+            rs = item.get("result_set", {})
+            if rs.get("data") and not data_rows:
+                cols = [
+                    col["name"]
+                    for col in rs.get("resultSetMetaData", {}).get("rowType", [])
+                ]
+                data_rows = [dict(zip(cols, row)) for row in rs["data"]]
+
+    if not answer_text:
+        answer_text = "I received a response but couldn't extract a text answer."
+
+    return ChatResponse(
+        answer=answer_text,
+        sql=sql_text,
+        data=data_rows,
+        chart_spec=chart_spec,
+        suggestions=suggestions or None,
+    )
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "agents": {pid: f"{p['database']}.{p['schema']}.{p['agent_name']}" for pid, p in AGENT_PROFILES.items()},
+        "default_agent": DEFAULT_AGENT,
+        "mode": "cortex_analyst" if USE_CORTEX_ANALYST else "cortex_agent",
+        "running_in_spcs": _is_running_in_spcs(),
+    }
+
+
+@app.get("/api/agents")
+def agents():
+    return {
+        "default": DEFAULT_AGENT,
+        "agents": [{"id": p["id"], "label": p["label"], "suggestions": p["suggestions"]} for p in AGENT_PROFILES.values()],
+    }
+
+
+@app.post("/api/debug")
+def debug(req: ChatRequest):
+    messages = [{"role": "user", "content": [{"type": "text", "text": req.question}]}]
+    try:
+        body = _call_agent(messages, _profile(req.agent))
+        return {"status_code": 200, "body": body}
+    except HTTPException as e:
+        return {"status_code": e.status_code, "body": e.detail}
+    except Exception as e:
+        return {"status_code": 500, "body": str(e)}
+
+
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
