@@ -212,6 +212,13 @@ Edit `frontend/index.html` to:
 - Add/remove suggested question buttons
 - Customize the table and chart rendering
 
+### Saved Chat History
+Chats can be kept in Snowflake for a few days and reopened from the **Recent chats** list (with a **+ New chat** button):
+1. Run `backend/chat_history_setup.sql` once (creates `PHARMA_DEMO.CHAT_APP.CHAT_HISTORY` and a daily purge task; works on trial accounts).
+2. Set `CHAT_HISTORY_DAYS=7` in `.env` and restart. `0` turns it off and the chat behaves as before.
+
+History is per browser (a random ID in local storage), not per Tableau user. Saving runs after each answer is sent, so a Snowflake error is logged and never breaks the chat.
+
 ### Production Deployment
 For production use:
 - Deploy to **SPCS** (recommended) for managed auth and networking
